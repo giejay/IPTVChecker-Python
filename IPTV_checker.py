@@ -42,6 +42,9 @@ class ScanConfig:
     retries: int = 6
     workers: int = 4
     insecure: bool = False
+    exclude_groups: list | None = None
+    exclude_channel_pattern: object | None = None
+    dry_run: bool = False
 
 
 ACTIVE_SUBPROCESSES = set()
@@ -1041,6 +1044,21 @@ def compile_channel_pattern(channel_search):
     except re.error as exc:
         raise ValueError(f"Invalid channel search regex '{channel_search}': {exc}") from exc
 
+def is_line_excluded(line, exclude_groups, exclude_channel_pattern):
+    """Return (excluded, reason) for an EXTINF line against exclusion rules."""
+    if not line.startswith('#EXTINF'):
+        return False, None
+    if exclude_groups:
+        group_name = get_group_name(line)
+        for ex_group in exclude_groups:
+            if group_name.strip().lower() == ex_group.strip().lower():
+                return True, f"group '{group_name}' is excluded"
+    if exclude_channel_pattern:
+        channel_name = get_channel_name(line)
+        if exclude_channel_pattern.search(channel_name):
+            return True, f"channel name '{channel_name}' matches exclusion pattern"
+    return False, None
+
 # Query parameters commonly used for tracking/auth tokens that change between sessions
 _TRACKING_PARAMS = frozenset({
     'token', 'auth', 'key', 'sig', 'signature', 'expires', 'expire',
@@ -1274,10 +1292,100 @@ def console_log_entry(playlist_file, current_channel, total_channels, channel_na
             print(f"{color}{prefix}{current_channel}/{total_channels} {status_symbol} {channel_name}\033[0m")
             logging.info(f"{prefix}{current_channel}/{total_channels} {status_symbol} {channel_name}")
 
+def dry_run_playlist(file_path, config, display_name=None):
+    """Print a structured overview of all groups and channels without checking streams."""
+    group_title = config.group_title
+    channel_search = config.channel_search
+    channel_pattern = config.channel_pattern
+    exclude_groups = config.exclude_groups
+    exclude_channel_pattern = config.exclude_channel_pattern
+
+    if channel_pattern is not None:
+        pattern = channel_pattern
+    else:
+        try:
+            pattern = compile_channel_pattern(channel_search)
+        except ValueError as exc:
+            logging.error(str(exc))
+            return
+
+    playlist_file = display_name or os.path.basename(file_path)
+    # group -> list of (channel_name, excluded, reason)
+    from collections import OrderedDict
+    groups = OrderedDict()
+    total = 0
+    excluded_count = 0
+
+    try:
+        with open(file_path, 'r', encoding='utf-8', errors='replace') as f:
+            pending_extinf = None
+            for raw_line in f:
+                line = raw_line.strip()
+                if line.startswith('#EXTINF'):
+                    pending_extinf = line
+                    continue
+                if pending_extinf is not None:
+                    if not line or line.startswith('#'):
+                        continue
+                    # We have a full entry
+                    extinf = pending_extinf
+                    pending_extinf = None
+                    channel_name = get_channel_name(extinf)
+                    group_name = get_group_name(extinf)
+
+                    # Apply inclusion filter (group + search)
+                    if not is_line_needed(extinf, group_title, pattern):
+                        continue
+
+                    total += 1
+                    ex, ex_reason = is_line_excluded(extinf, exclude_groups, exclude_channel_pattern)
+                    if ex:
+                        excluded_count += 1
+
+                    if group_name not in groups:
+                        groups[group_name] = []
+                    groups[group_name].append((channel_name, ex, ex_reason))
+    except (FileNotFoundError, PermissionError, OSError) as exc:
+        logging.error(f"Cannot read playlist '{file_path}': {exc}")
+        return
+
+    # --- Print overview ---
+    print(f"\n\033[96m{'='*60}\033[0m")
+    print(f"\033[96mDRY RUN — {playlist_file}\033[0m")
+    print(f"\033[96m{'='*60}\033[0m")
+    print(f"  Groups : {len(groups)}")
+    print(f"  Channels (after inclusion filter): {total}")
+    if excluded_count:
+        print(f"  Excluded by exclusion rules      : {excluded_count}")
+    print()
+
+    for group_name, channels in groups.items():
+        total_in_group = len(channels)
+        excluded_in_group = sum(1 for _, ex, _ in channels if ex)
+        group_label = f"\033[93m[{group_name}]\033[0m  ({total_in_group} channels"
+        if excluded_in_group:
+            group_label += f", {excluded_in_group} excluded"
+        group_label += ")"
+        print(group_label)
+        for ch_name, ex, ex_reason in channels:
+            if ex:
+                print(f"    \033[90m✕ {ch_name}  ← excluded: {ex_reason}\033[0m")
+            else:
+                print(f"    \033[92m• {ch_name}\033[0m")
+        print()
+
+    logging.info(f"Dry run complete for '{playlist_file}': {len(groups)} groups, {total} channels, {excluded_count} excluded.")
+
+
 def parse_m3u8_files(playlists, config):
     if not playlists:
         logging.error("No playlists to process.")
         return
+
+    if config.dry_run:
+        for file_path, label in playlists:
+            dry_run_playlist(file_path, config, label)
+        return []
 
     group_title = config.group_title
     timeout = config.timeout
@@ -1297,6 +1405,8 @@ def parse_m3u8_files(playlists, config):
     retries = config.retries
     workers = config.workers
     insecure = config.insecure
+    exclude_groups = config.exclude_groups
+    exclude_channel_pattern = config.exclude_channel_pattern
 
     session = requests.Session()
     session.headers.update({'User-Agent': 'VLC/3.0.14 LibVLC/3.0.14'})
@@ -1343,9 +1453,9 @@ def parse_m3u8_files(playlists, config):
                 f_output = None
 
     scan_results = []
-    for file_path in playlists:
-        playlist_file = os.path.basename(file_path)
-        base_playlist_name = os.path.splitext(playlist_file)[0]
+    for file_path, playlist_label in playlists:
+        playlist_file = playlist_label
+        base_playlist_name = os.path.splitext(os.path.basename(file_path))[0]
         playlist_dir = os.path.dirname(file_path) or '.'
         logging.info(f"Loading channels from {file_path} with group '{group_title}' and search '{channel_search if channel_search else 'None'}'...")
 
@@ -1370,14 +1480,20 @@ def parse_m3u8_files(playlists, config):
         working_channels = []
         dead_channels = []
         geoblocked_channels = []
+        dead_channels_detail = []  # {name, group, reason} per dead channel
 
         total_channels = 0
+        excluded_count = 0
         max_name_length = 0
         try:
             with open(file_path, 'r', encoding='utf-8', errors='replace') as file:
                 for raw_line in file:
                     line = raw_line.strip()
                     if is_line_needed(line, group_title, pattern):
+                        ex, _ = is_line_excluded(line, exclude_groups, exclude_channel_pattern)
+                        if ex:
+                            excluded_count += 1
+                            continue
                         total_channels += 1
                         channel_name = get_channel_name(line)
                         max_name_length = max(max_name_length, len(channel_name))
@@ -1431,6 +1547,11 @@ def parse_m3u8_files(playlists, config):
                             pending_extinf = line
                             pending_channel_name = get_channel_name(line)
                             pending_selected = is_line_needed(line, group_title, pattern)
+                            if pending_selected:
+                                ex, ex_reason = is_line_excluded(line, exclude_groups, exclude_channel_pattern)
+                                if ex:
+                                    logging.info(f"[EXCLUDED] '{pending_channel_name}' — {ex_reason}")
+                                    pending_selected = False
                             pending_metadata_lines = []
                         else:
                             if renamed_lines is not None:
@@ -1444,6 +1565,11 @@ def parse_m3u8_files(playlists, config):
                         pending_extinf = line
                         pending_channel_name = get_channel_name(line)
                         pending_selected = is_line_needed(line, group_title, pattern)
+                        if pending_selected:
+                            ex, ex_reason = is_line_excluded(line, exclude_groups, exclude_channel_pattern)
+                            if ex:
+                                logging.info(f"[EXCLUDED] '{pending_channel_name}' — {ex_reason}")
+                                pending_selected = False
                         pending_metadata_lines = []
                         continue
 
@@ -1626,6 +1752,11 @@ def parse_m3u8_files(playlists, config):
                             reason = result.get('error_reason') or 'Unknown'
                             error_summary[reason] = error_summary.get(reason, 0) + 1
                             dead_count += 1
+                            dead_channels_detail.append({
+                                'name': check_entry['channel_name'],
+                                'group': check_entry['group_value'],
+                                'reason': reason,
+                            })
                         else:
                             alive_count += 1
 
@@ -1689,12 +1820,17 @@ def parse_m3u8_files(playlists, config):
 
         checkpoint_writer.close()
 
+        if excluded_count:
+            logging.info(f"{playlist_file}: {excluded_count} channel(s) excluded by exclusion rules.")
+
         scan_results.append({
             'playlist': playlist_file,
             'total': total_channels,
             'alive': alive_count,
             'dead': dead_count,
             'geoblocked': geoblocked_count,
+            'excluded': excluded_count,
+            'dead_channels_detail': dead_channels_detail,
         })
 
         if split:
@@ -1769,6 +1905,15 @@ def parse_m3u8_files(playlists, config):
             print(f"  {reason}: {count}")
             logging.info(f"Dead channels - {reason}: {count}")
 
+    all_dead_details = [ch for r in scan_results for ch in r.get('dead_channels_detail', [])]
+    if all_dead_details:
+        print(f"\n\033[91mDead Channel List:\033[0m")
+        logging.info("Dead Channel List:")
+        for ch in all_dead_details:
+            line = f"  ✕ [{ch['group']}] {ch['name']}  —  {ch['reason']}"
+            print(f"\033[91m{line}\033[0m")
+            logging.info(line)
+
     return scan_results
 
 
@@ -1783,9 +1928,21 @@ def send_telegram_notification(token: str, chat_id: str, scan_results: list, not
     for r in scan_results:
         lines.append(f"*{r['playlist']}*")
         lines.append(f"  \u2705 Alive: {r['alive']}  \u274c Dead: {r['dead']}")
-        if r['geoblocked']:
+        if r.get('geoblocked'):
             lines.append(f"  \U0001f512 Geoblocked: {r['geoblocked']}")
-        lines.append(f"  Total checked: {r['total']}\n")
+        if r.get('excluded'):
+            lines.append(f"  \u26d4 Excluded: {r['excluded']}")
+        lines.append(f"  Total checked: {r['total']}")
+        dead_detail = r.get('dead_channels_detail', [])
+        if dead_detail:
+            lines.append("")
+            lines.append("  *Dead channels:*")
+            max_show = 30
+            for ch in dead_detail[:max_show]:
+                lines.append(f"  \u2022 [{ch['group']}] {ch['name']} — {ch['reason']}")
+            if len(dead_detail) > max_show:
+                lines.append(f"  _...and {len(dead_detail) - max_show} more_")
+        lines.append("")
 
     message = "\n".join(lines)
     url = f"https://api.telegram.org/bot{token}/sendMessage"
@@ -1844,6 +2001,12 @@ def main():
     parser.add_argument("-channel_search", "-c", type=str,
         default=os.environ.get("IPTV_CHANNEL_SEARCH"),
         help="Regex used to filter channels by name, case-insensitive (env: IPTV_CHANNEL_SEARCH)")
+    parser.add_argument("--exclude-group", "-xg", type=str,
+        default=os.environ.get("IPTV_EXCLUDE_GROUP"),
+        help="Comma-separated group names to exclude entirely (env: IPTV_EXCLUDE_GROUP)")
+    parser.add_argument("--exclude-channel", "-xc", type=str,
+        default=os.environ.get("IPTV_EXCLUDE_CHANNEL"),
+        help="Regex to exclude channels by name, case-insensitive (env: IPTV_EXCLUDE_CHANNEL)")
     parser.add_argument("-skip_screenshots", action="store_true",
         default=os.environ.get("IPTV_SKIP_SCREENSHOTS", "").lower() in ("1", "true", "yes"),
         help="Skip capturing screenshots for alive channels (env: IPTV_SKIP_SCREENSHOTS=true)")
@@ -1868,6 +2031,9 @@ def main():
     parser.add_argument("--telegram-notify", type=str, choices=["always", "on-errors"],
         default=os.environ.get("TELEGRAM_NOTIFY", "always"),
         help="When to send a Telegram notification: always or on-errors (env: TELEGRAM_NOTIFY)")
+    parser.add_argument("--dry-run", "-d", action="store_true",
+        default=os.environ.get("DRY_RUN", "").lower() in ("1", "true", "yes"),
+        help="Print a grouped overview of all channels/groups without checking streams (env: DRY_RUN=true)")
 
     args = parser.parse_args()
 
@@ -1892,6 +2058,15 @@ def main():
 
     try:
         channel_pattern = compile_channel_pattern(args.channel_search)
+    except ValueError as exc:
+        parser.error(str(exc))
+
+    exclude_groups = (
+        [g.strip() for g in args.exclude_group.split(",") if g.strip()]
+        if args.exclude_group else None
+    )
+    try:
+        exclude_channel_pattern = compile_channel_pattern(args.exclude_channel)
     except ValueError as exc:
         parser.error(str(exc))
 
@@ -1926,17 +2101,29 @@ def main():
 
     raw_inputs = [p.strip() for p in args.playlist.split(",") if p.strip()]
     _temp_playlist_files = []
-    playlists = []
+    playlists = []  # list of (file_path, display_label)
 
     for playlist_input in raw_inputs:
-        parsed_input = urlparse(playlist_input)
+        # Support optional "TITLE@url" or "TITLE@/path" syntax
+        display_name = None
+        actual_input = playlist_input
+        at_pos = playlist_input.find('@')
+        if at_pos > 0:
+            candidate_title = playlist_input[:at_pos].strip()
+            candidate_target = playlist_input[at_pos + 1:]
+            parsed_candidate = urlparse(candidate_target)
+            if parsed_candidate.scheme in ("http", "https") or candidate_target.startswith(('/', '~', '.')):
+                display_name = candidate_title
+                actual_input = candidate_target
+
+        parsed_input = urlparse(actual_input)
         if parsed_input.scheme in ("http", "https"):
-            logging.info(f"Downloading remote playlist from {playlist_input} ...")
+            logging.info(f"Downloading remote playlist from {actual_input} ...")
             try:
-                resp = requests.get(playlist_input, timeout=30)
+                resp = requests.get(actual_input, timeout=30)
                 resp.raise_for_status()
             except requests.RequestException as exc:
-                logging.error(f"Failed to download playlist from '{playlist_input}': {exc}")
+                logging.error(f"Failed to download playlist from '{actual_input}': {exc}")
                 continue
             url_path = parsed_input.path.rstrip("/") or "playlist"
             remote_name = os.path.basename(url_path) or "playlist"
@@ -1950,17 +2137,19 @@ def main():
             tmp.write(resp.content)
             tmp.close()
             _temp_playlist_files.append(tmp.name)
-            playlists.append(tmp.name)
+            label = display_name or os.path.splitext(remote_name)[0]
+            playlists.append((tmp.name, label))
         else:
-            local_input = os.path.expanduser(playlist_input)
+            local_input = os.path.expanduser(actual_input)
             if os.path.isdir(local_input):
                 for entry in sorted(os.listdir(local_input)):
                     full_path = os.path.join(local_input, entry)
                     if os.path.isfile(full_path) and entry.lower().endswith((".m3u", ".m3u8")):
-                        playlists.append(full_path)
+                        playlists.append((full_path, os.path.splitext(entry)[0]))
             else:
                 if os.path.isfile(local_input):
-                    playlists.append(local_input)
+                    label = display_name or os.path.splitext(os.path.basename(local_input))[0]
+                    playlists.append((local_input, label))
                 else:
                     logging.error(f"Playlist path not found: {local_input}")
 
@@ -1968,8 +2157,8 @@ def main():
         logging.error("No playlist files found to process.")
         return
 
-    for playlist in playlists:
-        logging.info(f"Will process playlist: {playlist}")
+    for file_path, label in playlists:
+        logging.info(f"Will process playlist: {label} ({file_path})")
 
     output_file = os.path.expanduser(args.output) if args.output else None
 
@@ -1992,6 +2181,9 @@ def main():
         retries=args.retries,
         workers=args.workers,
         insecure=args.insecure,
+        exclude_groups=exclude_groups,
+        exclude_channel_pattern=exclude_channel_pattern,
+        dry_run=args.dry_run,
     )
     scan_results = []
     try:

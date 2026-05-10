@@ -7,6 +7,9 @@ services:
       - ./data:/data
     env_file:
       - .env
-    # No command needed – IPTV_PLAYLIST env var drives the run.
+    # One-shot mode (default): container exits after each run.
+    # Cron mode: set CRON_SCHEDULE in .env (e.g. "0 6 * * *") – the container
+    # stays alive and reruns the checker on that schedule.
+    restart: unless-stopped
     # Override here to add extra CLI flags or test a different playlist:
     # command: ["/data/other.m3u", "-vv", "--split"]
