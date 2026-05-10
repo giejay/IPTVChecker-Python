@@ -15,6 +15,7 @@ import re
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import hashlib
+import tempfile
 from urllib.parse import urljoin, urlparse, parse_qs, urlencode, urlunparse
 from dataclasses import dataclass
 from requests.adapters import HTTPAdapter
@@ -1341,6 +1342,7 @@ def parse_m3u8_files(playlists, config):
                 logging.error(f"Unable to open output file '{output_file}': {exc}")
                 f_output = None
 
+    scan_results = []
     for file_path in playlists:
         playlist_file = os.path.basename(file_path)
         base_playlist_name = os.path.splitext(playlist_file)[0]
@@ -1401,6 +1403,9 @@ def parse_m3u8_files(playlists, config):
         pending_selected = False
         checkpoint_writer = CheckpointWriter(log_file)
         entries_to_check = []
+        alive_count = 0
+        dead_count = 0
+        geoblocked_count = 0
 
         def write_resume_entry(stream_hash, stream_url, channel_index):
             if not stream_hash or stream_hash in written_resume_entries:
@@ -1616,9 +1621,13 @@ def parse_m3u8_files(playlists, config):
 
                         if 'Geoblocked' in status:
                             geoblocked_summary[playlist_file] = geoblocked_summary.get(playlist_file, 0) + 1
+                            geoblocked_count += 1
                         elif status == 'Dead':
                             reason = result.get('error_reason') or 'Unknown'
                             error_summary[reason] = error_summary.get(reason, 0) + 1
+                            dead_count += 1
+                        else:
+                            alive_count += 1
 
                         console_log_entry(
                             playlist_file, check_entry['channel_index'], total_channels,
@@ -1679,6 +1688,14 @@ def parse_m3u8_files(playlists, config):
                     dead_channels.append(entry_lines)
 
         checkpoint_writer.close()
+
+        scan_results.append({
+            'playlist': playlist_file,
+            'total': total_channels,
+            'alive': alive_count,
+            'dead': dead_count,
+            'geoblocked': geoblocked_count,
+        })
 
         if split:
             working_playlist_path = os.path.join(playlist_dir, f"{base_playlist_name}_working.m3u8")
@@ -1752,29 +1769,117 @@ def parse_m3u8_files(playlists, config):
             print(f"  {reason}: {count}")
             logging.info(f"Dead channels - {reason}: {count}")
 
+    return scan_results
+
+
+def send_telegram_notification(token: str, chat_id: str, scan_results: list, notify: str) -> None:
+    """Send a Telegram message with the scan summary."""
+    has_issues = any(r['dead'] > 0 or r['geoblocked'] > 0 for r in scan_results)
+    if notify == 'on-errors' and not has_issues:
+        logging.info("Telegram: no issues found, skipping notification (notify=on-errors).")
+        return
+
+    lines = ["*IPTV Check Results*\n"]
+    for r in scan_results:
+        lines.append(f"*{r['playlist']}*")
+        lines.append(f"  \u2705 Alive: {r['alive']}  \u274c Dead: {r['dead']}")
+        if r['geoblocked']:
+            lines.append(f"  \U0001f512 Geoblocked: {r['geoblocked']}")
+        lines.append(f"  Total checked: {r['total']}\n")
+
+    message = "\n".join(lines)
+    url = f"https://api.telegram.org/bot{token}/sendMessage"
+    try:
+        resp = requests.post(
+            url,
+            json={"chat_id": chat_id, "text": message, "parse_mode": "Markdown"},
+            timeout=15,
+        )
+        resp.raise_for_status()
+        logging.info("Telegram notification sent.")
+    except requests.RequestException as exc:
+        logging.error(f"Failed to send Telegram notification: {exc}")
+
+
 def main():
     print_header()
 
-    parser = argparse.ArgumentParser(description="Check the status of channels in an IPTV M3U8 playlist and capture frames of live channels.")
-    parser.add_argument("playlist", type=str, help="Path to the M3U8 playlist file")
-    parser.add_argument("-group", "-g", type=str, default=None, help="Specific group title to check within the playlist")
-    parser.add_argument("-timeout", "-t", type=float, default=10.0, help="Timeout in seconds for checking channel status")
-    parser.add_argument("-v", action="count", default=0, help="Increase output verbosity (-v for info, -vv for debug)")
-    parser.add_argument("-extended", "-e", type=int, nargs='?', const=10, default=None, help="Enable extended timeout check for dead channels. Default is 10 seconds if used without specifying time.")
-    parser.add_argument("-split", "-s", action="store_true", help="Create separate playlists for working, dead, and geoblocked channels")
-    parser.add_argument("-rename", "-r", action="store_true", help="Rename alive channels to include video and audio info")
-    parser.add_argument("-proxy-list", "-p", type=str, default=None, help="Path to proxy list file for geoblock testing")
-    parser.add_argument("-test-geoblock", "-tg", action="store_true", help="Test geoblocked streams with proxies to confirm geoblocking")
-    parser.add_argument("--retries", "-R", type=int, default=6, help="Number of stream-check attempts (0-10)")
-    parser.add_argument("-output", "-o", type=str, default=None, help="Write channel details to CSV at the provided path")
-    parser.add_argument("-channel_search", "-c", type=str, default=None, help="Regex used to filter channels by name (case-insensitive)")
-    parser.add_argument("-skip_screenshots", action="store_true", help="Skip capturing screenshots for alive channels")
-    parser.add_argument("--profile-bitrate", "-b", action="store_true", help="Profile average video bitrate (slower, uses a 10-second ffmpeg sample)")
-    parser.add_argument("--backoff", "-B", type=str, choices=["none", "linear", "exponential"], default="linear", help="Retry backoff strategy: none, linear (1s,2s,3s...), exponential (1s,2s,4s...)")
-    parser.add_argument("--workers", "-w", type=int, default=4, help="Number of concurrent workers for channel checking (1-20, default: 4)")
-    parser.add_argument("--insecure", "-k", action="store_true", help="Disable SSL certificate verification for HTTPS streams")
+    parser = argparse.ArgumentParser(
+        description="Check the status of channels in an IPTV M3U8 playlist and capture frames of live channels.",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    parser.add_argument("playlist", type=str,
+        default=os.environ.get("IPTV_PLAYLIST"),
+        nargs="?",
+        help="Path(s) or HTTP(S) URL(s) to M3U8 playlist file(s), comma-separated for multiple (env: IPTV_PLAYLIST)")
+    parser.add_argument("-group", "-g", type=str,
+        default=os.environ.get("IPTV_GROUP"),
+        help="Specific group title to check within the playlist (env: IPTV_GROUP)")
+    parser.add_argument("-timeout", "-t", type=float,
+        default=float(os.environ.get("IPTV_TIMEOUT", "10.0")),
+        help="Timeout in seconds for checking channel status (env: IPTV_TIMEOUT)")
+    parser.add_argument("-v", action="count", default=0,
+        help="Increase output verbosity (-v for info, -vv for debug); env: IPTV_VERBOSE=1 or 2")
+    parser.add_argument("-extended", "-e", type=int, nargs='?', const=10,
+        default=int(os.environ["IPTV_EXTENDED"]) if os.environ.get("IPTV_EXTENDED") else None,
+        help="Enable extended timeout for dead channels in seconds (env: IPTV_EXTENDED)")
+    parser.add_argument("-split", "-s", action="store_true",
+        default=os.environ.get("IPTV_SPLIT", "").lower() in ("1", "true", "yes"),
+        help="Create separate playlists for working, dead, and geoblocked channels (env: IPTV_SPLIT=true)")
+    parser.add_argument("-rename", "-r", action="store_true",
+        default=os.environ.get("IPTV_RENAME", "").lower() in ("1", "true", "yes"),
+        help="Rename alive channels to include video and audio info (env: IPTV_RENAME=true)")
+    parser.add_argument("-proxy-list", "-p", type=str,
+        default=os.environ.get("IPTV_PROXY_LIST"),
+        help="Path to proxy list file for geoblock testing (env: IPTV_PROXY_LIST)")
+    parser.add_argument("-test-geoblock", "-tg", action="store_true",
+        default=os.environ.get("IPTV_TEST_GEOBLOCK", "").lower() in ("1", "true", "yes"),
+        help="Test geoblocked streams with proxies to confirm geoblocking (env: IPTV_TEST_GEOBLOCK=true)")
+    parser.add_argument("--retries", "-R", type=int,
+        default=int(os.environ.get("IPTV_RETRIES", "6")),
+        help="Number of stream-check attempts 0-10 (env: IPTV_RETRIES)")
+    parser.add_argument("-output", "-o", type=str,
+        default=os.environ.get("IPTV_OUTPUT"),
+        help="Write channel details to CSV at the provided path (env: IPTV_OUTPUT)")
+    parser.add_argument("-channel_search", "-c", type=str,
+        default=os.environ.get("IPTV_CHANNEL_SEARCH"),
+        help="Regex used to filter channels by name, case-insensitive (env: IPTV_CHANNEL_SEARCH)")
+    parser.add_argument("-skip_screenshots", action="store_true",
+        default=os.environ.get("IPTV_SKIP_SCREENSHOTS", "").lower() in ("1", "true", "yes"),
+        help="Skip capturing screenshots for alive channels (env: IPTV_SKIP_SCREENSHOTS=true)")
+    parser.add_argument("--profile-bitrate", "-b", action="store_true",
+        default=os.environ.get("IPTV_PROFILE_BITRATE", "").lower() in ("1", "true", "yes"),
+        help="Profile average video bitrate, slower (env: IPTV_PROFILE_BITRATE=true)")
+    parser.add_argument("--backoff", "-B", type=str, choices=["none", "linear", "exponential"],
+        default=os.environ.get("IPTV_BACKOFF", "linear"),
+        help="Retry backoff strategy: none, linear, exponential (env: IPTV_BACKOFF)")
+    parser.add_argument("--workers", "-w", type=int,
+        default=int(os.environ.get("IPTV_WORKERS", "4")),
+        help="Number of concurrent workers 1-20 (env: IPTV_WORKERS)")
+    parser.add_argument("--insecure", "-k", action="store_true",
+        default=os.environ.get("IPTV_INSECURE", "").lower() in ("1", "true", "yes"),
+        help="Disable SSL certificate verification (env: IPTV_INSECURE=true)")
+    parser.add_argument("--telegram-token", type=str,
+        default=os.environ.get("TELEGRAM_TOKEN"),
+        help="Telegram Bot API token for result notifications (env: TELEGRAM_TOKEN)")
+    parser.add_argument("--telegram-chat-id", type=str,
+        default=os.environ.get("TELEGRAM_CHAT_ID"),
+        help="Telegram chat or channel ID to send notifications to (env: TELEGRAM_CHAT_ID)")
+    parser.add_argument("--telegram-notify", type=str, choices=["always", "on-errors"],
+        default=os.environ.get("TELEGRAM_NOTIFY", "always"),
+        help="When to send a Telegram notification: always or on-errors (env: TELEGRAM_NOTIFY)")
 
     args = parser.parse_args()
+
+    # Allow IPTV_VERBOSE env var when -v flag is not supplied
+    if args.v == 0 and os.environ.get("IPTV_VERBOSE"):
+        try:
+            args.v = max(0, int(os.environ["IPTV_VERBOSE"]))
+        except ValueError:
+            pass
+
+    if args.playlist is None:
+        parser.error("playlist is required (pass as argument or set IPTV_PLAYLIST env var)")
 
     if not 0.5 <= args.timeout <= 300:
         parser.error("`-timeout/--timeout` must be between 0.5 and 300 seconds.")
@@ -1819,19 +1924,45 @@ def main():
             logging.error(f"No valid proxies loaded from {proxy_path}. Aborting.")
             return
 
-    playlist_input = os.path.expanduser(args.playlist)
+    raw_inputs = [p.strip() for p in args.playlist.split(",") if p.strip()]
+    _temp_playlist_files = []
     playlists = []
-    if os.path.isdir(playlist_input):
-        for entry in sorted(os.listdir(playlist_input)):
-            full_path = os.path.join(playlist_input, entry)
-            if os.path.isfile(full_path) and entry.lower().endswith((".m3u", ".m3u8")):
-                playlists.append(full_path)
-    else:
-        if os.path.isfile(playlist_input):
-            playlists.append(playlist_input)
+
+    for playlist_input in raw_inputs:
+        parsed_input = urlparse(playlist_input)
+        if parsed_input.scheme in ("http", "https"):
+            logging.info(f"Downloading remote playlist from {playlist_input} ...")
+            try:
+                resp = requests.get(playlist_input, timeout=30)
+                resp.raise_for_status()
+            except requests.RequestException as exc:
+                logging.error(f"Failed to download playlist from '{playlist_input}': {exc}")
+                continue
+            url_path = parsed_input.path.rstrip("/") or "playlist"
+            remote_name = os.path.basename(url_path) or "playlist"
+            if not remote_name.lower().endswith((".m3u", ".m3u8")):
+                remote_name += ".m3u8"
+            suffix = os.path.splitext(remote_name)[1]
+            tmp = tempfile.NamedTemporaryFile(
+                mode="wb", suffix=suffix, prefix=os.path.splitext(remote_name)[0] + "_",
+                delete=False
+            )
+            tmp.write(resp.content)
+            tmp.close()
+            _temp_playlist_files.append(tmp.name)
+            playlists.append(tmp.name)
         else:
-            logging.error(f"Playlist path not found: {playlist_input}")
-            return
+            local_input = os.path.expanduser(playlist_input)
+            if os.path.isdir(local_input):
+                for entry in sorted(os.listdir(local_input)):
+                    full_path = os.path.join(local_input, entry)
+                    if os.path.isfile(full_path) and entry.lower().endswith((".m3u", ".m3u8")):
+                        playlists.append(full_path)
+            else:
+                if os.path.isfile(local_input):
+                    playlists.append(local_input)
+                else:
+                    logging.error(f"Playlist path not found: {local_input}")
 
     if not playlists:
         logging.error("No playlist files found to process.")
@@ -1862,7 +1993,23 @@ def main():
         workers=args.workers,
         insecure=args.insecure,
     )
-    parse_m3u8_files(playlists, config)
+    scan_results = []
+    try:
+        scan_results = parse_m3u8_files(playlists, config)
+    finally:
+        for tmp_path in _temp_playlist_files:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+
+    if args.telegram_token and args.telegram_chat_id:
+        send_telegram_notification(
+            args.telegram_token,
+            args.telegram_chat_id,
+            scan_results or [],
+            args.telegram_notify,
+        )
 
 if __name__ == "__main__":
     main()

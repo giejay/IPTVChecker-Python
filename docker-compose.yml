@@ -1,0 +1,12 @@
+services:
+  iptv-checker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    volumes:
+      - ./data:/data
+    env_file:
+      - .env
+    # No command needed – IPTV_PLAYLIST env var drives the run.
+    # Override here to add extra CLI flags or test a different playlist:
+    # command: ["/data/other.m3u", "-vv", "--split"]
